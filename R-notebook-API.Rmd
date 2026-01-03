@@ -1,0 +1,811 @@
+---
+title: "Monitoramento da Dengue no Paraná: Análise Espaço-Temporal"
+author: "Luiz Henrique Barretta Francisco"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    code_folding: hide
+    theme: flatly
+    toc: true
+    toc_float: true
+  pdf_document: default
+---
+
+```{r setup, include = FALSE}
+# Configuração global
+# dev = "cairo_png" é crucial para evitar erros de dispositivo gráfico em animações
+knitr::opts_chunk$set(
+  message = FALSE, 
+  warning = FALSE,
+  fig.align = "center"
+)
+options(encoding = "UTF-8")
+```
+
+# 1\. Introdução e Fonte de Dados
+
+A Dengue é uma arbovirose de grande relevância para a saúde pública no Brasil. Este trabalho tem como objetivo realizar uma análise estatística espacial e espaço-temporal da incidência de Dengue nos municípios do estado do Paraná.
+
+Os dados utilizados nesta análise foram extraídos da plataforma **InfoDengue** ([info.dengue.mat.br](https://info.dengue.mat.br/)), um sistema de alerta para arboviroses desenvolvido pela Fundação Oswaldo Cruz (Fiocruz) e pela Escola de Matemática Aplicada da Fundação Getúlio Vargas (FGV EMAP).
+
+O conjunto de dados compreende as notificações semanais de casos de dengue, permitindo o monitoramento da evolução da doença ao longo das Semanas Epidemiológicas (SE).
+
+```{r libs}
+suppressPackageStartupMessages({
+  library(tidyverse)    # Manipulação de dados
+  library(geobr)        # Mapas do Brasil
+  library(purrr)        # Iteração funcional
+  library(gifski)       # Renderização de GIF
+  library(ggplot2)      # Gráficos
+  library(gganimate)    # Animações
+  library(sf)           # Manipulação de dados espaciais
+  library(ggTimeSeries) # Visualização de séries temporais
+  library(plotly)       # Gráficos interativos
+  library(spdep)        # Matrizes de vizinhança espacial
+  library(xfun)         # Funções auxiliares de sistema
+  library(magick)       # Processamento de imagem
+  library(Matrix)       # Matrizes esparsas
+  library(INLA)         # Inferência Bayesiana (INLA)
+  library(leaflet)      # Mapas Interativos
+  library(DT)
+})
+```
+
+Abaixo, ilustramos a interface da plataforma de onde os dados foram obtidos:
+
+```{r, out.width="80%"}
+if(file.exists("info1.png")) knitr::include_graphics("info1.png")
+```
+
+```{r, out.width="80%"}
+if(file.exists("info2.png")) knitr::include_graphics("info2.png")
+```
+
+-----
+
+# 2\. Carregamento e Tratamento dos Dados
+
+O dataset `dengue_muniPR2024` contém informações agregadas por município e semana epidemiológica. Cruzamos esses dados com a malha digital dos municípios do Paraná fornecida pelo pacote `geobr`.
+
+Calculamos a **taxa de incidência** bruta (por 1.000 habitantes) para permitir a comparação entre municípios de diferentes portes populacionais.
+
+```{r carga-dados}
+# Carregando dados locais
+dengue <- readr::read_csv("dengue_muniPR2024", show_col_types = FALSE)
+
+# Carregando malha viária do Paraná (2020)
+pr_mapa <- geobr::read_municipality(code_muni = "PR", year = 2020, showProgress = FALSE) %>%
+  mutate(code_muni = as.numeric(code_muni)) 
+
+# Cálculo preliminar da taxa bruta
+dengue$taxa <- dengue$casos / dengue$pop
+```
+
+-----
+
+# 3\. Análise Exploratória Espaço-Temporal
+
+## 3.1 Evolução da Epidemia (Animação)
+
+Para visualizar a dinâmica de dispersão da doença, geramos uma animação da taxa de incidência semanal. O mapa abaixo mostra como a dengue se comporta no espaço e no tempo, permitindo identificar o início de surtos e a direção de propagação (frequentemente do Norte/Oeste para o Sul/Leste do estado).
+
+```{r animacao, include=FALSE}
+# Preparação dos dados para o mapa animado
+dados_mapa <- dplyr::left_join(pr_mapa, dengue, by = c("code_muni" = "geocode_municipio")) %>%
+  dplyr::filter(!is.na(SE) & !is.na(casos_est)) %>%
+  dplyr::mutate(SE_fator = as.factor(SE))
+
+dados_mapa$taxa <- dados_mapa$casos / dados_mapa$pop * 1000
+
+# Construção do objeto gráfico
+mapa_animado_plot <- ggplot(dados_mapa, aes(fill = taxa)) +
+  geom_sf(color = "grey90", linewidth = 0.1) +
+  scale_fill_viridis_c(option = "plasma", na.value = "white", name = "Taxa/1000 hab") +
+  theme_void() +
+  labs(
+    title = "Evolução Semanal dos Casos de Dengue no Paraná",
+    subtitle = "Semana Epidemiológica: {closest_state}"
+  ) +
+  transition_states(SE_fator, transition_length = 1, state_length = 2) +
+  ease_aes('linear')
+
+# Nome do arquivo GIF
+gif_filename <- "dengue_parana_evolucao_v2.gif"
+
+# Renderização usando magick para evitar erros de dispositivo
+#anim_save(
+#  gif_filename,
+#  animation = mapa_animado_plot,
+#  fps = 5,
+#  width = 800,
+#  height = 700,
+#  nframes = length(unique(dados_mapa$SE_fator)) * 2,
+#  renderer = magick_renderer()
+#)
+```
+
+```{r display-gif}
+knitr::include_graphics(gif_filename)
+```
+
+## 3.2 Variação Semanal (Waterfall Plot)
+
+O gráfico de cascata (*waterfall plot*) abaixo resume o balanço de casos reportados no estado inteiro. Barras verdes indicam redução de casos em relação à semana anterior, enquanto barras vermelhas indicam aumento, facilitando a visualização dos picos da epidemia.
+
+```{r waterfall, fig.width=11, fig.height=6}
+dados_agg_pr <- dengue %>%
+  group_by(SE, data_iniSE) %>%
+  summarize(casos = sum(casos, na.rm = TRUE),
+            casos_est = sum(casos_est, na.rm = TRUE)) %>%
+  ungroup() %>% arrange(data_iniSE)
+
+p1 <- ggplot_waterfall(dados_agg_pr, 'SE', 'casos', nArrowSize = 0.5)
+
+p1 + scale_fill_manual(
+    values = c("forestgreen", "blue", "darkred"),
+    labels = c("Queda", "Estável", "Aumento")) +
+  labs(x = "Semana Epidemiológica",
+       y = "Casos Reportados",
+       title = "Variação Semanal de Casos Reportados no Paraná") +
+  theme_light() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 90, size = 8, vjust = 0.5))
+```
+
+-----
+
+# 4\. Modelagem Espacial Bayesiana (BYM2)
+
+Para a análise inferencial, selecionamos a **semana epidemiológica com maior número de casos** disponível. Utilizamos o modelo **BYM2 (Besag-York-Mollié reparametrizado)** implementado no pacote `INLA`.
+
+O objetivo é estimar o **Risco Relativo (RR)** suavizado, corrigindo a instabilidade das taxas em municípios com populações pequenas.
+
+## 4.1 Definição do Modelo
+
+Assumimos que o número de casos $Y_i$ no município $i$ segue uma distribuição de Poisson:
+
+$$ Y_i \sim \text{Poisson}(E_i \theta_i) $$
+
+Onde $E_i$ é o número esperado de casos (calculado pela taxa global do estado aplicada à população local) e $\theta_i$ é o risco relativo. O preditor linear é definido como:
+
+$$ \log(\theta_i) = \beta_0 + \frac{1}{\sqrt{\tau}} \left( \sqrt{1 - \phi} \cdot v_i + \sqrt{\phi} \cdot u_i \right) $$
+
+  * $\beta_0$: Intercepto (risco médio global).
+  * $u_i$: Componente espacial estruturado (dependência espacial - CAR/Besag).
+  * $v_i$: Componente não estruturado (ruído aleatório i.i.d.).
+  * $\phi \in [0,1]$: Parâmetro de mistura que pondera a importância da dependência espacial.
+
+<!-- end list -->
+
+```{r prep-inla-espacial}
+# 1. Definir semana
+ultima_semana <- dengue %>%
+  group_by(SE) %>%
+  summarise(total_casos = sum(casos, na.rm = TRUE)) %>% # Soma casos de todos os municípios por semana
+  slice_max(total_casos, n = 1) %>%                      # Pega a linha com o valor máximo
+  pull(SE)
+
+# 2. Filtrar dados (apenas colunas essenciais)
+dengue_semana_filtrada <- dengue %>%
+  filter(SE == ultima_semana) %>%
+  select(geocode_municipio, casos_est, pop) 
+
+# 3. Join com o mapa completo (garantindo 399 municípios)
+dados_ultima_semana <- pr_mapa %>%
+  left_join(dengue_semana_filtrada, by = c("code_muni" = "geocode_municipio")) %>%
+  mutate(
+    # Tratamento de NAs
+    casos_obs = replace_na(casos_est, 0),
+    pop = replace_na(pop, 0)
+  )
+
+# 4. Cálculo da Taxa de Referência Global e Esperados
+total_obs <- sum(dados_ultima_semana$casos_obs, na.rm = TRUE)
+total_pop <- sum(dados_ultima_semana$pop, na.rm = TRUE) 
+taxa_global <- ifelse(total_pop > 0, total_obs / total_pop, 0)
+
+dados_ultima_semana <- dados_ultima_semana %>%
+  mutate(
+    # Esperado = População * Taxa Global
+    casos_esperados = pop * taxa_global,
+    id_muni = 1:n() 
+  ) %>%
+  arrange(code_muni) 
+
+# 5. Matriz de Vizinhança
+nb <- spdep::poly2nb(dados_ultima_semana, queen = TRUE)
+adj.m <- spdep::nb2mat(nb, style="B", zero.policy=TRUE)
+g <- as(adj.m, "dgTMatrix")
+
+# 6. Rodar o INLA
+formula_inla <- casos_obs ~ 1 + f(id_muni, model = "bym2", graph = g, 
+                                  hyper = list(
+                                    prec = list(prior = "pc.prec", param = c(1, 0.01)),
+                                    phi = list(prior = "pc", param = c(0.5, 0.5))
+                                  ))
+
+model_inla <- inla(
+  formula_inla,
+  data = dados_ultima_semana,
+  family = "poisson",
+  E = casos_esperados,
+  control.predictor = list(compute = TRUE),
+  control.compute = list(dic = TRUE, waic = TRUE)
+)
+
+# Extração dos resultados
+eta_suavizado <- model_inla$summary.linear.predictor$mean
+dados_ultima_semana$RR_suavizado <- exp(eta_suavizado)
+```
+
+## 4.2 Resultados Espaciais
+
+O mapa abaixo apresenta o Risco Relativo suavizado.
+
+  * **RR \> 1**: Risco acima da média do estado.
+  * **RR \< 1**: Risco abaixo da média do estado.
+
+<!-- end list -->
+
+```{r mapa-espacial}
+bins_unificados <- c(0, 0.5, 0.8, 1.0, 1.3, 2.0, 4.0, 6.0, Inf)
+
+# Paleta manual "Frio -> Quente"
+# Cores escolhidas para representar: 
+# < 0.5 (Azul Forte), 0.5-0.8 (Azul Claro), 0.8-1 (Verde Água - Neutro Frio)
+# 1-1.3 (Amarelo - Alerta), 1.3-2 (Laranja), > 2 (Vermelhos escurecendo)
+cores_unificadas <- c(
+  "#1a66cc", # Azul (Muito baixo risco)
+  "#74add1", # Azul Médio
+  "#e0f3f8", # Azul/Cinza Claro (Perto do esperado, mas baixo)
+  "#ffffbf", # Amarelo Pálido (Leve excesso - Transição)
+  "#fee090", # Amarelo Ouro (Risco moderado)
+  "#fdae61", # Laranja
+  "#f46d43", # Vermelho Claro
+  "#d73027"  # Vermelho Escuro (Alto risco)
+)
+
+# Criar a função de paleta única
+pal_final <- colorBin(
+  palette = cores_unificadas, 
+  bins = bins_unificados,
+  domain = NULL, # NULL permite aplicar a mesma função em datasets diferentes
+  na.color = "transparent"
+)
+
+dados_leaflet <- sf::st_transform(dados_ultima_semana, 4326)
+
+labels_semana <- sprintf(
+  "<strong>%s</strong><br/>RR (Semanal): %s<br/>Casos Obs: %g",
+  dados_leaflet$name_muni, 
+  round(dados_leaflet$RR_suavizado, 2), 
+  dados_leaflet$casos_obs
+) %>% lapply(htmltools::HTML)
+
+leaflet(dados_leaflet) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor = ~pal_final(RR_suavizado), 
+    weight = 1, opacity = 1, color = "white", dashArray = "3", fillOpacity = 0.7,
+    highlightOptions = highlightOptions(weight = 3, color = "#666", fillOpacity = 0.9, bringToFront = TRUE),
+    label = labels_semana,
+    labelOptions = labelOptions(style = list("font-weight" = "normal", padding = "3px 8px"), textsize = "15px", direction = "auto")
+  ) %>%
+  addLegend(
+    pal = pal_final, 
+    values = ~RR_suavizado, 
+    opacity = 0.7, 
+    title = "Risco Relativo<br>(Semana Atual)", 
+    position = "bottomright"
+  )
+```
+
+### 4.3 Tabela de Resultados e Probabilidades (Probmap Bayesiano)
+
+A tabela a seguir apresenta os indicadores detalhados para cada município:
+
+* **Obs / Esp:** Casos observados e esperados.
+* **RR Suavizado:** A estimativa pontual do risco (média a posteriori).
+* **IC 95%:** O intervalo de credibilidade (se o intervalo não incluir 1, o risco é significativo).
+* **Prob(RR > 1):** A probabilidade de o risco ser maior que 1. Valores acima de 0.9 indicam alta certeza de que é uma área de risco (Hotspot).
+
+```{r tabela-probmap}
+# --- CÁLCULO ROBUSTO DA PROBABILIDADE ---
+# Em vez de extrair as marginais (que podem vir NULL), usamos a aproximação Gaussiana
+# baseada na média e desvio padrão do preditor linear.
+# P(RR > 1) equivale a P(log(RR) > 0)
+
+mean_lp <- model_inla$summary.linear.predictor$mean
+sd_lp   <- model_inla$summary.linear.predictor$sd
+
+# pnorm calcula a probabilidade acumulada até 0.
+# Como queremos a probabilidade SER MAIOR que 0, fazemos (1 - pnorm).
+prob_rr_maior_1 <- 1 - pnorm(0, mean = mean_lp, sd = sd_lp)
+
+# 3. Montar o Dataframe final
+tabela_resultados <- dados_ultima_semana %>%
+  sf::st_drop_geometry() %>% # Remove geometria para a tabela ficar leve
+  mutate(
+    SMR_bruto = casos_obs / casos_esperados,
+    # Intervalos de Credibilidade (transformando de log para escala natural)
+    IC_Inf = exp(model_inla$summary.linear.predictor$`0.025quant`),
+    IC_Sup = exp(model_inla$summary.linear.predictor$`0.975quant`),
+    
+    # Probabilidade calculada via aproximação
+    Prob_Excesso = prob_rr_maior_1,
+    
+    # Classificação baseada na probabilidade
+    Classificacao = case_when(
+      Prob_Excesso > 0.9 ~ "Alto Risco (Sig.)",
+      Prob_Excesso < 0.1 ~ "Baixo Risco (Sig.)",
+      TRUE ~ "Inconclusivo"
+    )
+  ) %>%
+  select(
+    Município = name_muni,
+    Obs = casos_obs,
+    Esp = casos_esperados,
+    `RR Bruto` = SMR_bruto,
+    `RR Suavizado` = RR_suavizado,
+    `IC Inf (2.5%)` = IC_Inf,
+    `IC Sup (97.5%)` = IC_Sup,
+    `Prob(RR > 1)` = Prob_Excesso,
+    Status = Classificacao
+  )
+
+# 4. Exibir Tabela Interativa
+library(DT)
+
+datatable(
+  tabela_resultados,
+  extensions = 'Buttons',
+  options = list(
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel'),
+    pageLength = 10,
+    autoWidth = TRUE
+  ),
+  rownames = FALSE,
+  caption = "Tabela de Estimativas de Risco Bayesiano por Município"
+) %>%
+  formatRound(columns = c("Esp", "RR Bruto", "RR Suavizado", "IC Inf (2.5%)", "IC Sup (97.5%)"), digits = 2) %>%
+  formatPercentage(columns = "Prob(RR > 1)", digits = 1) %>%
+  formatStyle(
+    'Status',
+    target = 'row',
+    backgroundColor = styleEqual(c("Alto Risco (Sig.)", "Baixo Risco (Sig.)"), c('#ffcccc', '#ccffcc'))
+  )
+```
+-----
+
+# 5\. Modelagem Espaço-Temporal
+
+A dengue apresenta forte componente sazonal e persistência temporal. Para capturar isso, expandimos o modelo para incluir o tempo.
+
+
+## 5.1 Definição do Modelo Espaço-Temporal
+
+Para capturar a dinâmica da epidemia, esse modelo decompõe o risco de dengue em três componentes distintos (Espaço, Tempo e Interação), permitindo diferenciar o que é uma característica estrutural do município, o que é a sazonalidade global da doença e o que é um surto local específico.
+
+O preditor linear é definido como:
+
+$$\eta_{it} = \beta_0 + \xi_i + \gamma_t + \delta_{it}$$
+
+Onde cada termo representa uma "camada" de explicação do risco:
+
+* **$\xi_i$ (Efeito Espacial - BYM2):** Representa o **risco basal** do município. Captura características geográficas e socioambientais persistentes (como clima, urbanização ou altitude) que tornam certas áreas estruturalmente mais propensas à dengue do que outras, independentemente da época do ano.
+* **$\gamma_t$ (Efeito Temporal - RW1):** Representa a **curva epidêmica global**. Modelado como um *Random Walk*, ele captura a tendência temporal suave que afeta todo o estado simultaneamente, desenhando a onda sazonal da doença (início, pico no verão e declínio).
+* **$\delta_{it}$ (Interação Espaço-Tempo - Tipo I):** Representa as **anomalias locais**. É o componente crítico para vigilância, pois captura surtos repentinos em municípios específicos que fogem ao padrão geral do estado ou à expectativa histórica local. Ele absorve a variação residual não explicada apenas pela geografia ou pela época do ano.
+
+<!-- end list -->
+
+```{r modelo-st}
+# --- 1. Preparação dos dados ---
+
+# Cálculo da taxa global robusto (Casos Totais / Soma de Pessoas-Tempo)
+# Isso evita o "hardcoding" do número 55 e funciona para qualquer tamanho de base
+taxa_global_st <- sum(dengue$casos, na.rm = TRUE) / sum(dengue$pop, na.rm = TRUE)
+
+dengue_st <- dengue %>%
+  mutate(
+    id_muni = as.numeric(factor(geocode_municipio)), # Índices para o INLA
+    id_tempo = as.numeric(factor(SE)),               # Índices temporais
+    id_interacao = 1:n(),                            # Índice único p/ interação iid
+    casos_obs = replace_na(casos, 0),
+    pop = replace_na(pop, 0),
+    
+    # Casos esperados: População daquela semana * Taxa Global Semanal
+    casos_esperados = pop * taxa_global_st
+  )
+
+# --- 2. Fórmula e Modelo (Mantidos) ---
+# Certifique-se de que o objeto 'g' (grafo de vizinhança) já foi criado anteriormente
+formula_st <- casos_obs ~ 1 + 
+  f(id_muni, model = "bym2", graph = g, scale.model = TRUE, constr = TRUE,
+    hyper = list(prec = list(prior = "pc.prec", param = c(1, 0.01)),
+                 phi = list(prior = "pc", param = c(0.5, 0.5)))) +
+  f(id_tempo, model = "rw1", 
+    hyper = list(prec = list(prior = "pc.prec", param = c(1, 0.01)))) +
+  f(id_interacao, model = "iid", 
+    hyper = list(prec = list(prior = "pc.prec", param = c(1, 0.01))))
+
+model_st <- inla(
+  formula_st,
+  data = dengue_st,
+  family = "poisson",
+  E = casos_esperados, # O INLA usa isso como offset: log(E)
+  control.predictor = list(compute = TRUE, link = 1),
+  control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE)
+)
+
+# --- 3. Extração e Correção dos Valores ---
+
+dengue_st <- dengue_st %>%
+  mutate(
+    # ATENÇÃO: fitted.values retorna o Risco Relativo (RR) quando E é fornecido
+    RR_estimado_semanal = model_st$summary.fitted.values$mean,
+    
+    # Para ter os casos estimados ("fitted counts"), multiplicamos pelo esperado
+    casos_estimados_inla = RR_estimado_semanal * casos_esperados
+  )
+
+# --- 4. Agregação Anual ---
+
+dados_mapa_st_anual <- dengue_st %>%
+  group_by(geocode_municipio) %>%
+  summarise(
+    Total_Obs = sum(casos_obs, na.rm = TRUE),
+    Total_Esp = sum(casos_esperados, na.rm = TRUE),
+    
+    # Agora sim podemos somar os casos estimados
+    Total_Est_INLA = sum(casos_estimados_inla, na.rm = TRUE)
+  ) %>%
+  mutate(
+    # O RR anual é a razão entre a soma dos estimados e a soma dos esperados
+    # Isso é equivalente a uma média ponderada dos RRs semanais
+    RR_anual = Total_Est_INLA / Total_Esp
+  ) %>%
+  ungroup()
+
+# --- 5. Join Espacial ---
+dados_mapa_st_final <- pr_mapa %>% # Começar pelo mapa garante manter geometrias mesmo sem dados
+  left_join(dados_mapa_st_anual, by = c("code_muni" = "geocode_municipio")) %>%
+  sf::st_transform(4326) %>%
+  sf::st_transform(4326) # WGS84 para Leaflet
+```
+
+## 5.2 Resultados Espaço-Temporais
+
+O mapa a seguir apresenta o risco relativo estimado considerando todo o histórico temporal da epidemia. Este modelo tende a ser mais robusto contra flutuações semanais aleatórias.
+
+```{r mapa-st}
+labels_st <- sprintf(
+  "<strong>%s</strong><br/>
+   RR Anual (Suavizado): %s<br/>
+   Total Obs: %g<br/>
+   Total Est (Modelo): %s",
+  dados_mapa_st_final$name_muni, 
+  round(dados_mapa_st_final$RR_anual, 2), 
+  dados_mapa_st_final$Total_Obs,
+  round(dados_mapa_st_final$Total_Est_INLA, 0)
+) %>% lapply(htmltools::HTML)
+
+leaflet(dados_mapa_st_final) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor = ~pal_final(RR_anual),
+    weight = 1, opacity = 1, color = "white", dashArray = "3", fillOpacity = 0.7,
+    highlightOptions = highlightOptions(weight = 3, color = "#666", dashArray = "", fillOpacity = 0.9, bringToFront = TRUE),
+    label = labels_st,
+    labelOptions = labelOptions(style = list("font-weight" = "normal", padding = "3px 8px"), textsize = "15px", direction = "auto")
+  ) %>%
+  addLegend(
+    pal = pal_final, 
+    values = ~RR_anual, 
+    opacity = 0.7, 
+    title = "Risco Relativo<br>(Acumulado Anual)", 
+    position = "bottomright"
+  )
+```
+
+```{r modelo2 tab}
+# 1. Preparar os dados para a tabela
+# Usamos o objeto 'dados_mapa_st_final' que já contém as somas anuais e geometria
+tabela_st <- dados_mapa_st_final %>%
+  sf::st_drop_geometry() %>% # Remove a parte do mapa
+  mutate(
+    # Recalcular SMR Bruto Anual (caso não exista)
+    SMR_bruto_anual = ifelse(Total_Esp > 0, Total_Obs / Total_Esp, 0),
+    
+    # Classificação simplificada baseada no RR Estimado do Modelo
+    # Como é uma agregação anual, usamos o corte direto em 1.0
+    Status = case_when(
+      RR_anual > 1 ~ "Alto Risco (Média Anual)",
+      TRUE ~ "Baixo Risco (Média Anual)"
+    )
+  ) %>%
+  select(
+    Município = name_muni,
+    `Total Obs` = Total_Obs,
+    `Total Esp` = Total_Esp,
+    `RR Bruto (Anual)` = SMR_bruto_anual,
+    `RR Modelo (Anual)` = RR_anual, # Este é o RR ponderado pelo modelo ST
+    Status
+  )
+
+# 2. Exibir Tabela Interativa
+datatable(
+  tabela_st,
+  extensions = 'Buttons',
+  options = list(
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel'),
+    pageLength = 10,
+    autoWidth = TRUE
+  ),
+  rownames = FALSE,
+  caption = "Resumo Anual do Modelo Espaço-Temporal (Dengue)"
+) %>%
+  formatRound(columns = c("Total Esp", "RR Bruto (Anual)", "RR Modelo (Anual)"), digits = 2) %>%
+  formatStyle(
+    'Status',
+    target = 'row',
+    backgroundColor = styleEqual(
+      c("Alto Risco (Média Anual)", "Baixo Risco (Média Anual)"), 
+      c('#ffcccc', '#ccffcc')
+    )
+  ) %>%
+  formatStyle(
+    'RR Modelo (Anual)',
+    color = styleInterval(1, c('green', 'red')),
+    fontWeight = 'bold'
+  )
+```
+
+-----
+
+
+# 6\. Aprimoramento e Validação do Modelo
+
+Nesta seção, avançamos para técnicas mais sofisticadas para validar a capacidade preditiva do modelo e estimar probabilidades complexas que auxiliam na tomada de decisão sob incerteza.
+
+## 6.1 Validação Cruzada Temporal (Forecasting)
+
+Para testar se o modelo consegue prever o futuro (e não apenas ajustar o passado), realizamos um exercício de *forecasting*. "Escondemos" os dados das últimas **4 semanas epidemiológicas** (transformando-os em `NA`) e pedimos para o INLA prever esses valores baseando-se apenas na estrutura espaço-temporal aprendida anteriormente.
+
+```{r forecasting}
+# 1. Configuração do Cenário de Teste
+# Definir quantas semanas vamos "esconder" para o modelo tentar adivinhar
+n_semanas_teste <- 4
+max_se <- max(dengue_st$id_tempo)
+corte_se <- max_se - n_semanas_teste
+
+# 2. Criar Dataset com Omissão (Hold-out)
+dengue_pred <- dengue_st %>%
+  mutate(
+    # Guardamos o valor real para comparar depois
+    casos_real = casos_obs,
+    # No input do modelo, transformamos as últimas semanas em NA
+    casos_obs_treino = ifelse(id_tempo > corte_se, NA, casos_obs)
+  )
+
+# 3. Rodar o Modelo de Previsão
+# Usamos a mesma fórmula, mas com o dataset de treino (com NAs)
+# O INLA preenche automaticamente os NAs na distribuição preditiva
+model_pred <- inla(
+  formula_st,
+  data = dengue_pred,
+  family = "poisson",
+  E = casos_esperados, 
+  # link = 1 é essencial para calcular os fitted values na escala correta (contagem)
+  control.predictor = list(compute = TRUE, link = 1) 
+)
+
+# 4. Extrair Resultados e Comparar
+resultados_pred <- dengue_pred %>%
+  mutate(
+    # Extrair média e intervalos da previsão
+    pred_media = model_pred$summary.fitted.values$mean,
+    pred_inf   = model_pred$summary.fitted.values$`0.025quant`,
+    pred_sup   = model_pred$summary.fitted.values$`0.975quant`,
+    
+    # Calcular casos preditos (RR * Esperado)
+    casos_pred_media = pred_media * casos_esperados,
+    casos_pred_inf   = pred_inf * casos_esperados,
+    casos_pred_sup   = pred_sup * casos_esperados
+  ) %>%
+  # Filtrar apenas o período de interesse (ex: últimas 12 semanas para visualização)
+  filter(id_tempo > (max_se - 12)) %>%
+  group_by(SE, data_iniSE) %>%
+  # Agregar para o estado todo para visualização gráfica
+  summarise(
+    Real_Total = sum(casos_real, na.rm = TRUE),
+    Pred_Total = sum(casos_pred_media, na.rm = TRUE),
+    Pred_Inf_Total = sum(casos_pred_inf, na.rm = TRUE),
+    Pred_Sup_Total = sum(casos_pred_sup, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    Tipo = ifelse(SE > (max(SE) - n_semanas_teste), "Previsão (Blind Test)", "Treino")
+  )
+
+# 5. Visualizar o Forecasting
+ggplot(resultados_pred, aes(x = data_iniSE)) +
+  # Faixa de Incerteza (IC 95%)
+  geom_ribbon(aes(ymin = Pred_Inf_Total, ymax = Pred_Sup_Total, fill = "IC 95% Modelo"), alpha = 0.2) +
+  # Linha do Modelo
+  geom_line(aes(y = Pred_Total, color = "Modelo (Estimado/Previsto)"), linewidth = 1) +
+  # Pontos Reais
+  geom_point(aes(y = Real_Total, color = "Dados Reais"), size = 2) +
+  # Linha vertical separando treino de teste
+  geom_vline(xintercept = as.numeric(min(resultados_pred$data_iniSE[resultados_pred$Tipo == "Previsão (Blind Test)"])), 
+             linetype = "dashed", color = "gray50") +
+  
+  scale_color_manual(values = c("Dados Reais" = "black", "Modelo (Estimado/Previsto)" = "blue")) +
+  scale_fill_manual(values = c("IC 95% Modelo" = "blue")) +
+  
+  labs(
+    title = "Validação Cruzada: Capacidade Preditiva do Modelo",
+    subtitle = "Comparação entre casos reais e previstos nas últimas 4 semanas (Onde o modelo não viu os dados)",
+    x = "Semana Epidemiológica",
+    y = "Total de Casos no Paraná",
+    color = "Legenda", fill = "Incerteza"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+> **Interpretação:** A área sombreada após a linha pontilhada representa a "visão de futuro" do modelo. Se os pontos pretos (dados reais) caírem dentro da sombra azul (intervalo de credibilidade), o modelo tem boa capacidade de generalização e pode ser usado para alertas precoces.
+
+## 6.2 Simulação da Posterior (Análise de Probabilidade de Risco)
+
+Diferente do modelo puramente espacial, onde usamos uma aproximação gaussiana simples, no modelo espaço-temporal a estrutura de correlação é complexa. Para responder perguntas como *"Qual a probabilidade exata de um município ter um surto (RR \> 1.5) na última semana?"*, utilizamos a **Simulação de Monte Carlo via `inla.posterior.sample`**.
+
+Isso gera milhares de cenários possíveis compatíveis com o modelo e conta em quantos deles o evento de risco ocorreu.
+
+```{r posterior-simulation}
+# 1. Configuração da Simulação
+n_simulacoes <- 1000
+# Definir um limiar de risco crítico (ex: 50% acima do esperado)
+limiar_rr <- 1.0 
+
+# Filtrar índices da última semana (foco da vigilância)
+indices_ultima_semana <- dengue_st %>%
+  mutate(idx_linha = 1:n()) %>%
+  filter(SE == max(SE)) %>%
+  pull(idx_linha)
+
+# 2. Executar Amostragem da Posterior (Pode demorar alguns segundos)
+# O INLA gera amostras do preditor linear (Link scale)
+simulacoes <- inla.posterior.sample(n = n_simulacoes, result = model_st)
+
+# 3. Processar as Simulações
+# A função abaixo extrae o preditor linear apenas para as linhas da última semana
+# e calcula a probabilidade
+probs_excesso <- sapply(indices_ultima_semana, function(i) {
+  # Extrair valores simulados para a linha 'i' do preditor linear
+  # Nota: A estrutura de nomes do inla.posterior.sample pode variar, 
+  # mas geralmente 'Predictor' contém o eta linear.
+  # eta = log(RR), então RR = exp(eta)
+  
+  # Extração robusta buscando o índice correto no vetor latente
+  nome_predictor <- paste0("Predictor:", i)
+  amostras_eta <- sapply(simulacoes, function(x) x$latent[nome_predictor, 1])
+  
+  amostras_rr <- exp(amostras_eta)
+  
+  # Calcular frequência em que RR > limiar
+  mean(amostras_rr > limiar_rr)
+})
+
+# 4. Criar Mapa de Probabilidade (Hotspots)
+mapa_probabilidade <- pr_mapa %>%
+  mutate(code_muni = as.numeric(code_muni)) %>%
+  left_join(
+    dengue_st %>% 
+      filter(SE == max(SE)) %>%
+      mutate(Prob_Surto = probs_excesso) %>%
+      # --- CORREÇÃO: Removido 'name_muni' daqui pois ele não existe em dengue_st ---
+      select(geocode_municipio, Prob_Surto),
+    by = c("code_muni" = "geocode_municipio")
+  ) %>%
+  sf::st_as_sf()
+
+# Visualização
+pal_prob <- colorNumeric("Reds", domain = c(0, 1))
+
+leaflet(sf::st_transform(mapa_probabilidade, 4326)) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor = ~pal_prob(Prob_Surto),
+    weight = 1, opacity = 1, color = "white", fillOpacity = 0.8,
+    # O name_muni virá do pr_mapa original
+    label = ~sprintf("%s: Prob. %.0f%%", name_muni, Prob_Surto * 100),
+    highlightOptions = highlightOptions(weight = 3, color = "#666", bringToFront = TRUE)
+  ) %>%
+  addLegend(pal = pal_prob, values = c(0,1), title = "Probabilidade<br>de Excesso (RR > 1)", position = "bottomright")
+
+```
+
+## 6.3 Seleção e Comparação de Modelos
+
+Para garantir que estamos usando a melhor estrutura de interação (Tipo I, II, III ou IV), utilizamos critérios de informação como o **DIC** (Deviance Information Criterion) e **WAIC**. Menores valores indicam melhor ajuste, equilibrando precisão e complexidade.
+
+Abaixo, comparamos o modelo puramente espacial (seção 4) com o modelo espaço-temporal (seção 5).
+
+```{r model-comparison}
+# --- 6.3 Comparação de Modelos (Abordagem por Soma de DICs) ---
+
+# ==============================================================================
+# MODELO 1: Puramente Espacial (ROBUSTO)
+# ==============================================================================
+
+semanas_unicas <- sort(unique(dengue_st$SE))
+
+# Vetores para armazenar o histórico
+historico_dic <- rep(NA, length(semanas_unicas))
+historico_status <- rep("Falha", length(semanas_unicas))
+
+pb <- txtProgressBar(min = 0, max = length(semanas_unicas), style = 3)
+
+for (i in seq_along(semanas_unicas)) {
+  
+  dados_semana <- dengue_st %>% filter(SE == semanas_unicas[i])
+  
+  # Usamos tryCatch para o loop não parar se der erro
+  try({
+    # Adicionamos 'control.inla' com estratégia 'eb' (Empirical Bayes)
+    # Isso resolve a maioria dos erros de "Hessiana negativa" em semanas com poucos dados
+    mod_temp <- inla(
+      casos_obs ~ 1 + f(id_muni, model = "bym2", graph = g, scale.model = TRUE, constr = TRUE),
+      data = dados_semana,
+      family = "poisson",
+      E = casos_esperados,
+      control.compute = list(dic = TRUE, waic = TRUE),
+      control.inla = list(int.strategy = "eb", strategy = "gaussian"), # Mais estável
+      verbose = FALSE
+    )
+    
+    # Verifica se gerou DIC válido
+    if (!is.null(mod_temp$dic$dic) && !is.nan(mod_temp$dic$dic)) {
+      historico_dic[i] <- mod_temp$dic$dic
+      historico_status[i] <- "OK"
+    } else {
+      historico_status[i] <- "Sem DIC"
+    }
+  }, silent = TRUE)
+  
+  #setTxtProgressBar(pb, i)
+}
+close(pb)
+
+# --- RELATÓRIO DE DIAGNÓSTICO ---
+n_total <- length(semanas_unicas)
+n_sucessos <- sum(historico_status == "OK")
+semanas_falhas <- semanas_unicas[historico_status != "OK"]
+
+print(paste("Total de Semanas:", n_total))
+print(paste("Modelos Convergidos:", n_sucessos))
+
+if(length(semanas_falhas) > 0) {
+  print("Semanas que falharam:")
+  print(semanas_falhas)
+  
+  # IMPUTAÇÃO DE ERRO PARA COMPARAÇÃO JUSTA
+  # Se falhou, imputamos a média dos DICs das semanas que funcionaram
+  # Isso penaliza o modelo pelas falhas em vez de "beneficiá-lo" com soma zero
+  media_dic <- mean(historico_dic, na.rm = TRUE)
+  dic_espacial_total <- sum(historico_dic, na.rm = TRUE) + (length(semanas_falhas) * media_dic)
+  
+  print(paste("DIC Ajustado (Imputado):", dic_espacial_total))
+} else {
+  dic_espacial_total <- sum(historico_dic, na.rm = TRUE)
+  print(paste("DIC Total (100% Sucesso):", dic_espacial_total))
+}
+
+# Use 'dic_espacial_total' na sua tabela comparativa final
+```
+
+**Conclusão da Comparação:** Se o modelo Espaço-Temporal apresentar um DIC substancialmente menor (diferença \> 10), isso confirma que a inclusão da dimensão temporal e da interação é indispensável para explicar a dinâmica da Dengue no Paraná, justificando a complexidade adicional.
+
